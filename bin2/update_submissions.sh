@@ -1,0 +1,2 @@
+export PYTHONPATH=$PYTHONPATH:/cil/shed/apps/internal/sra_submission_tool:/cil/shed/apps/internal/vesper/libs:/cil/shed/apps/internal/vesper/:/home/unix/amr/.conda/envs/sra_tool/lib/python2.7/site-packages/
+/broad/software/free/Linux/redhat_6_x86_64/pkgs/python_2.6.5/bin/python /home/unix/amr/dev/python/sra_submission_tool/bin/update_submissions.py "$@"

@@ -1,0 +1,202 @@
+__author__ = "Amr Abouelleil"
+
+from SRA_submission_tool.xml_service import XmlCreator
+from SRA_submission_tool.file_service import BamValidator, PacBioService
+from SRA_submission_tool.submission_db import SubmissionDBService
+from SRA_submission_tool.transfer_service import AsperaTransfer
+from SRA_submission_tool.screening_service import ScreeningService
+import SRA_submission_tool.constants as c
+import shutil
+from sub_monitor_service import SubmissionMonitor
+import time
+import sys
+import logging
+import os
+import cx_Oracle
+import traceback
+
+
+class ProcessHandler(object):
+    """
+    A class for executing the steps required to submit data to SRA.
+    """
+    def __init__(self):
+        self.logger = logging.getLogger('sra_tool.process_handler.ProcessHandler')
+        self.dbs = SubmissionDBService(c.submission_db)
+
+    def process_prod_single(self, args):
+        """
+        A method for processing a single submission to the SRA of production data with various metadata in diverse
+        sources including bam header, Mercury database, and Manhattan.
+        :param args: a dictionary containing metadata required for SRA submission.
+        :return:
+        """
+        try:
+            #Bam validation for bam files
+            self.dbs.update_sub_data(args['spuid'], column_id="submission_status", column_value="running")
+            if self.determine_file_type(args['read_file']) == 'bam':
+                temp_dir = args['temp_dir']
+                self.logger.debug(msg="Temporary working directory created: " + temp_dir)
+                if args['host_screen']:
+                    sc = ScreeningService()
+                    self.dbs.update_sub_data(args['spuid'], column_id="submission_status", column_value="screening")
+                    s_file = sc.screen_human(read_file=args['read_file'],
+                                             file_type=self.determine_file_type(args['read_file']), output_dir=temp_dir,
+                                             spuid=c.spuid_prefix + args['spuid'], library_layout='paired')
+                    args['read_file'] = s_file
+                    self.logger.info("Screened file: " + s_file)
+                    temp_read_file = temp_dir + "/" + args['read_file'].split('/')[-1]
+                    self.dbs.update_sub_data(args['spuid'], column_id="submission_status", column_value="screened")
+                else:
+                    temp_read_file = temp_dir + "/" + args['read_file'].split('/')[-1]
+                    os.symlink(args['read_file'], temp_read_file)
+                bv = BamValidator()
+                bv.validate_bam(args['read_file'], args['spuid'])
+                self.logger.debug(msg="Temporary data file created: " + temp_read_file)
+                #xml handling
+                xc = XmlCreator(args['g_project'])
+                att = xc.create_xml_file(deliverable_fields=['ncbi_biosample_id', 'ncbi_bioproject_id'],
+                                         spuid=c.spuid_prefix + str(args['spuid']), release_date=args['release_date'],
+                                         selection_method=args['library_selection_method'], read_file=temp_read_file,
+                                         construct_protocol=args['library_protocol'], temp_path=temp_dir,
+                                         additional_attributes=args['additional_attributes'],
+                                         library_source=args['library_source'])
+                ready_file = temp_dir + "/submit.ready"
+                open(ready_file, "w").close()
+                self.logger.debug(msg="Ready file created: " + ready_file)
+                for k, v in {'g_number': args['g_project'],
+                             'biosample': att['ncbi_biosample_id'],
+                             'bioproject': att['ncbi_bioproject_id'],
+                             'release_date': args['release_date'],
+                             'xml_attributes': str(att).replace('\"', '').replace("\'", "").replace('\n', '')}.items():
+                    self.dbs.update_sub_data(args['spuid'], column_id=k, column_value=v)
+                if args['dry_run']:
+                    self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status",
+                                             column_value="failed")
+                    self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="response_message",
+                                             column_value="DR Complete")
+                    sys.exit(0)
+                at = AsperaTransfer(spuid=args['spuid'].replace("BI_", ""))
+                self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status", column_value="uploading")
+                at.aspera_submit(c.asp_acct, temp_dir, c.sra_root_dir)
+                # sleeps the program an amount of time the scales based on read file size
+                sleep_time = int(os.path.getsize(args['read_file'])/c.transfer_speed)
+                self.logger.info("Calculated sleep time based on read file size: " + str(sleep_time) + " seconds.")
+                time.sleep(sleep_time)
+                at.aspera_submit(c.asp_acct, ready_file, c.sra_root_dir + "/" + temp_dir.split('/')[-1])
+                monitor = SubmissionMonitor()
+                self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status", column_value="monitoring")
+                time.sleep(120)  # Sleep here to wait for NCBI to generate report.xml file before launching sub monitor
+                monitor.monitor_submission(remote_sub_path=c.sra_root_dir + "/" + temp_dir.split('/')[-1] + "/report.xml",
+                                           local_sub_dir=temp_dir, spuid_suffix=args['spuid'], retry=True)
+                shutil.rmtree(temp_dir)
+            else:
+                self.logger.error(self.determine_file_type(args['read_file']) +
+                                  " IS NOT A PRODUCTION FILE. USE MANUAL SUBMISSION MODE INSTEAD!")
+        except cx_Oracle.InterfaceError as e:
+            self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status",
+                                     column_value="InterfaceError")
+            self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="response_message",
+                                     column_value=str(e))
+            raise e
+
+    def process_manual(self, args):
+        """
+        A method for submitting data to sra where all metadata is provided to the method via an arguments dictionary.
+        :param args: a dictionary containing metadata required for SRA submissions.
+        :return:
+        """
+        try:
+            self.logger.debug("Manual processing arguments received:" + str(args))
+            self.dbs.update_sub_data(args['spuid'], column_id="submission_status", column_value="running")
+            temp_dir = args['temp_dir']
+            self.logger.debug(msg="Temporary working directory created: " + temp_dir)
+            temp_file = temp_dir + "/" + args['read_file'].split('/')[-1]
+            if args['file_type'] == 'PacBio_HDF5':
+                self.logger.info(msg="PacBio data detected.")
+                pbs = PacBioService()
+                pb_file_data = pbs.get_pacbio_files_data(args['read_file'])
+                for f in pb_file_data['file_list']:
+                    temp_f = temp_dir + "/" + f.split('/')[-1]
+                    os.symlink(f, temp_f)
+                args['file_list'] = pb_file_data['file_list']
+            else:
+                if args['host_screen']:
+                    sc = ScreeningService()
+                    self.dbs.update_sub_data(args['spuid'], column_id="submission_status", column_value="screening")
+                    s_file = sc.screen_human(read_file=args['read_file'],
+                                             file_type=self.determine_file_type(args['read_file']), output_dir=temp_dir,
+                                             spuid=c.spuid_prefix + args['spuid'], library_layout='paired')
+                    args['read_file'] = s_file
+                    self.logger.info("Screened file: " + s_file)
+                    temp_file = temp_dir + "/" + args['read_file'].split('/')[-1]
+                    self.dbs.update_sub_data(args['spuid'], column_id="submission_status", column_value="screened")
+                else:
+                    temp_file = temp_dir + "/" + args['read_file'].split('/')[-1]
+                    print(temp_file)
+		    if not os.path.exists(temp_file):
+		        os.symlink(args['read_file'], temp_file)
+            self.logger.debug(msg="Temporary data file created: " + temp_file)
+            mx = XmlCreator()
+            mx.create_xml_from_dict(args, temp_dir, args['file_type'])
+            if args['dry_run']:
+                self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status", column_value="failed")
+                self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="response_message", column_value="DR Complete")
+                sys.exit(0)
+            at = AsperaTransfer(spuid=args['spuid'].replace("BI_", ""))
+            self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status", column_value="uploading")
+            at.aspera_submit(c.asp_acct, temp_dir, c.sra_root_dir)
+            # sleeps the program an amount of time the scales based on read file size
+            sleep_time = int(os.path.getsize(args['read_file'])/c.transfer_speed)
+            self.logger.info("Calculated sleep time based on file size:" + str(sleep_time))
+            time.sleep(sleep_time)
+            self.logger.debug("Inserting data into database for SPUID " + args['spuid'])
+            ready_file = temp_dir + "/submit.ready"
+            open(ready_file, "w").close()
+            self.logger.debug(msg="Ready file created: " + ready_file)
+            at.aspera_submit(c.asp_acct, ready_file, c.sra_root_dir + "/" + temp_dir.split('/')[-1])
+            for k, v in {'g_number': "None", 'read_file': args['read_file'], 'temp_path': temp_dir,
+                         'release_date': args['release_date'], 'biosample': args['ncbi_biosample_id'],
+                         'bioproject': args['ncbi_bioproject_id'],
+                         'xml_attributes': str(args['additional_attributes']).replace('\"', '').replace("\'", "")
+                         .replace('\n', '')}.items():
+                self.dbs.update_sub_data(args['spuid'].split('_')[-1], column_id=k, column_value=v)
+            monitor = SubmissionMonitor()
+            # Sleep here to wait for NCBI to generate report.xml file before launching sub monitor
+            time.sleep(120)
+            self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status", column_value="monitoring")
+            monitor.monitor_submission(remote_sub_path=c.sra_root_dir + "/" + temp_dir.split('/')[-1] + "/report.xml",
+                                       local_sub_dir=temp_dir, spuid_suffix=args['spuid'].split('_')[-1], retry=True)
+            shutil.rmtree(temp_dir)
+        except TypeError as e:
+            self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="submission_status", column_value="TypeError")
+            self.dbs.update_sub_data(args['spuid'].replace("BI_", ""), column_id="response_message", column_value=str(e))
+            traceback.print_exc()
+            traceback.print_stack()
+
+    def check_row(self, row):
+        """
+        A simple row validator method that assigns a release date if none is provided and ensures required fields
+        are filled out by the user.
+        :param row: A row of data from a csv file in a dictionary container.
+        :return: a validated row containing a release date.
+        """
+        for k, v in row.items():
+            if k == 'release_date' and v == '':
+                row['release_date'] = time.strftime('%Y-%m-%d')
+                self.logger.info(row['release_date'] + ' release date assigned for' + row['read_file'])
+            elif k == '' and v == '':
+                del row[k]
+                continue
+            elif v == '' and (k != 'additional_attributes' and k!='reference_file'):
+                self.logger.error(k + ' MUST NOT BE EMPTY. FILL OUT THIS COLUMN AND RERUN SRA SUBMISSION TOOL!')
+                sys.exit(-1)
+        return row
+
+    def determine_file_type(self, file_path):
+        """
+        A method for parsing a file path that returns the file extensions.
+        :param file_path: The full path to the file
+        :return: the file extensions as a string.
+        """
+        return (file_path.split('/')[-1]).split('.')[-1]
